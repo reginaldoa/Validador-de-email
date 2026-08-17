@@ -1,0 +1,194 @@
+"""
+Validador de E-mails a partir de XLSX
+---------------------------------------
+Lê um arquivo .xlsx com uma coluna "EMAIL", valida cada e-mail em 3 níveis
+(formato / domínio / caixa real via SMTP) e gera um novo .xlsx com o
+resultado ao lado de cada linha original.
+
+Requisitos:
+    pip install dnspython openpyxl pandas
+
+Uso:
+    python validador_email_xlsx.py
+
+Ao rodar, abre uma JANELA para você escolher o arquivo de entrada
+e outra janela para escolher onde salvar o resultado.
+"""
+
+import re
+import socket
+import smtplib
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill
+
+try:
+    import dns.resolver
+    TEM_DNSPYTHON = True
+except ImportError:
+    TEM_DNSPYTHON = False
+
+REGEX_EMAIL = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+EMAIL_VERIFICADOR = "verificacao@meudominio.com"
+NOME_COLUNA_EMAIL = "EMAIL"  # nome da coluna no seu xlsx
+
+
+def validar_formato(email: str) -> bool:
+    if not isinstance(email, str):
+        return False
+    email = email.strip()
+    if not email or " " in email:
+        return False
+    return bool(REGEX_EMAIL.match(email))
+
+
+def obter_mx(dominio: str):
+    if not TEM_DNSPYTHON:
+        return None
+    try:
+        respostas = dns.resolver.resolve(dominio, "MX")
+        registros = sorted(respostas, key=lambda r: r.preference)
+        return str(registros[0].exchange).rstrip(".")
+    except Exception:
+        return None
+
+
+def verificar_caixa_smtp(email: str, mx_host: str, timeout: int = 8) -> str:
+    try:
+        servidor = smtplib.SMTP(timeout=timeout)
+        servidor.connect(mx_host, 25)
+        servidor.helo("meudominio.com")
+        servidor.mail(EMAIL_VERIFICADOR)
+        codigo, _ = servidor.rcpt(email)
+        servidor.quit()
+        if codigo == 250:
+            return "existe"
+        elif codigo in (550, 551, 553):
+            return "nao_existe"
+        return "indeterminado"
+    except (socket.timeout, ConnectionRefusedError, smtplib.SMTPException, OSError):
+        return "indeterminado"
+
+
+def validar_email_completo(email) -> dict:
+    resultado = {
+        "formato_valido": "Não",
+        "dominio_existe": "Não",
+        "caixa_existe": "não verificado",
+        "status_final": "❌ inválido",
+    }
+
+    if not validar_formato(email):
+        return resultado
+    resultado["formato_valido"] = "Sim"
+
+    dominio = str(email).split("@")[-1]
+    mx_host = obter_mx(dominio)
+
+    if not mx_host:
+        resultado["status_final"] = "❌ domínio sem servidor de e-mail"
+        return resultado
+    resultado["dominio_existe"] = "Sim"
+
+    caixa = verificar_caixa_smtp(str(email).strip(), mx_host)
+    resultado["caixa_existe"] = caixa
+
+    if caixa == "existe":
+        resultado["status_final"] = "✅ válido (caixa confirmada)"
+    elif caixa == "nao_existe":
+        resultado["status_final"] = "❌ caixa não existe"
+    else:
+        resultado["status_final"] = "⚠️ formato/domínio ok, caixa não confirmada"
+
+    return resultado
+
+
+def processar(caminho_entrada: str, caminho_saida: str):
+    df = pd.read_excel(caminho_entrada)
+
+    if NOME_COLUNA_EMAIL not in df.columns:
+        colunas = ", ".join(df.columns)
+        raise ValueError(
+            f"Não encontrei a coluna '{NOME_COLUNA_EMAIL}'. "
+            f"Colunas encontradas: {colunas}"
+        )
+
+    total = len(df)
+    print(f"Validando {total} e-mails... isso pode demorar alguns segundos por linha.\n")
+
+    formatos, dominios, caixas, status = [], [], [], []
+    for i, email in enumerate(df[NOME_COLUNA_EMAIL], start=1):
+        r = validar_email_completo(email)
+        formatos.append(r["formato_valido"])
+        dominios.append(r["dominio_existe"])
+        caixas.append(r["caixa_existe"])
+        status.append(r["status_final"])
+        print(f"[{i}/{total}] {email} -> {r['status_final']}")
+
+    df["FORMATO_VALIDO"] = formatos
+    df["DOMINIO_EXISTE"] = dominios
+    df["CAIXA_EXISTE"] = caixas
+    df["STATUS_FINAL"] = status
+
+    df.to_excel(caminho_saida, index=False)
+
+    # Formatação: cabeçalho em negrito + destaque de cor por status
+    wb = load_workbook(caminho_saida)
+    ws = wb.active
+
+    for cel in ws[1]:
+        cel.font = Font(bold=True, name="Arial")
+
+    col_status = df.columns.get_loc("STATUS_FINAL") + 1
+    verde = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    vermelho = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    amarelo = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+
+    for row in range(2, ws.max_row + 1):
+        valor = ws.cell(row=row, column=col_status).value
+        if valor and "✅" in valor:
+            ws.cell(row=row, column=col_status).fill = verde
+        elif valor and "❌" in valor:
+            ws.cell(row=row, column=col_status).fill = vermelho
+        elif valor and "⚠️" in valor:
+            ws.cell(row=row, column=col_status).fill = amarelo
+
+    wb.save(caminho_saida)
+    print(f"\n📄 Resultado salvo em: {caminho_saida}")
+
+
+def escolher_arquivos():
+    """Abre janelas para escolher o xlsx de entrada e onde salvar o de saída."""
+    root = tk.Tk()
+    root.withdraw()  # esconde a janela principal, mostra só os diálogos
+    root.attributes("-topmost", True)  # traz o diálogo para frente
+
+    entrada = filedialog.askopenfilename(
+        title="Selecione a planilha com a coluna EMAIL",
+        filetypes=[("Arquivos Excel", "*.xlsx *.xls")],
+    )
+    if not entrada:
+        messagebox.showwarning("Cancelado", "Nenhum arquivo selecionado. Encerrando.")
+        return None, None
+
+    saida = filedialog.asksaveasfilename(
+        title="Escolha onde salvar o resultado",
+        defaultextension=".xlsx",
+        filetypes=[("Arquivos Excel", "*.xlsx")],
+        initialfile="resultado_validacao_emails.xlsx",
+    )
+    if not saida:
+        messagebox.showwarning("Cancelado", "Nenhum local de saída escolhido. Encerrando.")
+        return None, None
+
+    root.destroy()
+    return entrada, saida
+
+
+if __name__ == "__main__":
+    entrada, saida = escolher_arquivos()
+    if entrada and saida:
+        processar(entrada, saida)
